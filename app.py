@@ -85,11 +85,28 @@ def get_drive_service():
     if "gcp_service_account" not in st.secrets:
         return None
     try:
-        creds_info = dict(st.secrets["gcp_service_account"])
+        raw_sa = st.secrets["gcp_service_account"]
+        if isinstance(raw_sa, str):
+            creds_info = json.loads(raw_sa)
+        else:
+            creds_info = dict(raw_sa)
+            
+        # PEM private_key 서식 자동 복원 및 정규화
+        if "private_key" in creds_info:
+            pk = str(creds_info["private_key"])
+            m = re.search(r"(-+BEGIN [^-]+-+)([\s\S]*?)(-+END [^-]+-+)", pk)
+            if m:
+                header = m.group(1).strip()
+                body = m.group(2)
+                footer = m.group(3).strip()
+                clean_body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+                b_lines = [clean_body[j:j+64] for j in range(0, len(clean_body), 64)]
+                creds_info["private_key"] = header + chr(10) + chr(10).join(b_lines) + chr(10) + footer + chr(10)
+
         creds = service_account.Credentials.from_service_account_info(
-            creds_info, scopes=['https://www.googleapis.com/auth/drive']
+            creds_info, scopes=["https://www.googleapis.com/auth/drive"]
         )
-        service = build('drive', 'v3', credentials=creds)
+        service = build("drive", "v3", credentials=creds)
         return service
     except Exception as e:
         st.error(f"구글 드라이브 서비스 계정 연결 오류: {e}")
@@ -533,7 +550,7 @@ with tab_drive:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 with tab_upload:
-    st.info("이 탭은 구글 드라이브를 거치지 않고, 스마트폰이나 PC의 로컬 파일을 직접 웹 화면에 드래그하여 바로 추출할 때 사용합니다.")
+    st.info("이탭은 구글 드라이브를 거치지 않고, 스마트폰이나 PC의 로컬 파일을 직접 웹 화면에 드래그하여 바로 추출할 때 사용합니다.")
     up_pdf = st.file_uploader("작업 대상 PDF 업로드:", type=["pdf"])
     up_db = st.file_uploader("소명/추출 대상자 DB 업로드 (선택):", type=["xlsx", "xls"])
     if up_pdf and st.button("직접 업로드 파일로 추출 실행"):

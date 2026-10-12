@@ -127,22 +127,37 @@ def get_drive_service(custom_creds_info=None):
         st.error(f"구글 드라이브 서비스 계정 연결 오류: {e}")
         return None
 
-def list_drive_files_in_folder(service, folder_id):
-    """지정된 드라이브 폴더 내 파일 및 폴더 목록 조회"""
+def get_folder_metadata(service, folder_id):
+    """폴더의 이름 및 상위 폴더(부모) ID 조회"""
     if not service or not folder_id:
-        return [], []
+        return {'id': folder_id, 'name': '알 수 없음', 'parents': []}
+    try:
+        f = service.files().get(fileId=folder_id, fields="id, name, parents", supportsAllDrives=True).execute()
+        return f
+    except Exception:
+        return {'id': folder_id, 'name': '소득재산 작업', 'parents': []}
+
+def get_folder_contents(service, folder_id):
+    """지정된 드라이브 폴더 내 하위 폴더 및 파일 목록 실시간 조회"""
+    if not service or not folder_id:
+        return [], [], []
     try:
         q = f"'{folder_id}' in parents and trashed = false"
         results = service.files().list(
-            q=q, fields="files(id, name, mimeType, size)", pageSize=100
+            q=q, fields="files(id, name, mimeType, size)", pageSize=200,
+            supportsAllDrives=True, includeItemsFromAllDrives=True
         ).execute()
         items = results.get('files', [])
         folders = [f for f in items if f['mimeType'] == 'application/vnd.google-apps.folder']
-        files = [f for f in items if f['mimeType'] != 'application/vnd.google-apps.folder']
-        return folders, files
+        folders.sort(key=lambda x: x['name'])
+        pdf_files = [f for f in items if f['name'].lower().endswith('.pdf')]
+        pdf_files.sort(key=lambda x: x['name'])
+        excel_files = [f for f in items if f['name'].lower().endswith(('.xlsx', '.xls'))]
+        excel_files.sort(key=lambda x: x['name'])
+        return folders, pdf_files, excel_files
     except Exception as e:
         st.error(f"폴더 내용 조회 실패: {e}")
-        return [], []
+        return [], [], []
 
 def download_file_from_drive(service, file_id, local_dest_path):
     """구글 드라이브 파일을 로컬 임시 경로로 다운로드"""
@@ -257,16 +272,61 @@ with tab_drive:
                 st.error(f"키 파일 읽기 실패: {e_up}")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="card-box"><div class="card-title">1. 구글 드라이브 작업 폴더 및 대상 파일 설정</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-box"><div class="card-title">1. 📂 구글 드라이브 실시간 폴더 탐색기 및 파일 설정</div>', unsafe_allow_html=True)
     
-    # 기본 폴더 ID (사용자의 소득재산 작업 폴더 ID)
-    default_folder_id = "1X6wWQ_Gik-TgoPXscItFO-B30xmTDIMF"
-    folder_id_input = st.text_input("구글 드라이브 작업 폴더 ID:", value=default_folder_id)
+    default_work_folder_id = "1X6wWQ_Gik-TgoPXscItFO-B30xmTDIMF"
+    if "current_folder_id" not in st.session_state:
+        st.session_state.current_folder_id = default_work_folder_id
+        
+    current_folder_id = st.session_state.current_folder_id
+    cur_folder_meta = get_folder_metadata(drive_svc, current_folder_id)
+    cur_folder_name = cur_folder_meta.get('name', '소득재산 작업')
+    cur_parent_ids = cur_folder_meta.get('parents', [])
+    
+    subfolders, pdf_files, excel_files = get_folder_contents(drive_svc, current_folder_id)
 
-    folders_list, files_list = list_drive_files_in_folder(drive_svc, folder_id_input)
-    
-    pdf_files = [f for f in files_list if f['name'].lower().endswith('.pdf')]
-    excel_files = [f for f in files_list if f['name'].lower().endswith(('.xlsx', '.xls'))]
+    # Colab 스타일 실시간 위치 표시 및 상위/하위 폴더 이동 바
+    st.markdown(f"""
+    <div style="background-color: #020617; padding: 12px 16px; border-radius: 6px; border: 1px solid #334155; margin-bottom: 12px;">
+        <span style="color: #94A3B8; font-size: 13px;">📍 현재 탐색 위치:</span><br>
+        <span style="color: #38BDF8; font-size: 17px; font-weight: 700;">📁 {cur_folder_name}</span>
+        <span style="color: #64748B; font-size: 13px; margin-left: 10px;">(PDF {len(pdf_files)}개 | 엑셀 {len(excel_files)}개 | 하위폴더 {len(subfolders)}개)</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    nav_c1, nav_c2, nav_c3 = st.columns([1.2, 2.2, 1.2])
+    with nav_c1:
+        has_parent = len(cur_parent_ids) > 0
+        if st.button("⬆️ 상위 폴더로 이동", disabled=not has_parent, use_container_width=True):
+            if has_parent:
+                st.session_state.current_folder_id = cur_parent_ids[0]
+                st.rerun()
+
+    with nav_c2:
+        sub_options = ["(📂 하위 폴더 진입 선택...)"] + [f"{f['name']}/" for f in subfolders]
+        selected_sub = st.selectbox("하위 폴더 이동:", options=sub_options, key=f"sub_select_{current_folder_id}", label_visibility="collapsed")
+        if selected_sub != "(📂 하위 폴더 진입 선택...)":
+            t_name = selected_sub.rstrip('/')
+            match_folder = next((f for f in subfolders if f['name'] == t_name), None)
+            if match_folder:
+                st.session_state.current_folder_id = match_folder['id']
+                st.rerun()
+
+    with nav_c3:
+        if st.button("🏠 기본 작업폴더 복귀", use_container_width=True):
+            st.session_state.current_folder_id = default_work_folder_id
+            st.rerun()
+
+    with st.expander("🔗 다른 폴더 링크(URL) 또는 ID 직접 입력하여 이동"):
+        c_in_url = st.text_input("폴더 링크(URL) 또는 ID:", value=current_folder_id, key="manual_folder_in")
+        if st.button("해당 폴더로 즉시 이동"):
+            m_id = re.search(r'folders/([a-zA-Z0-9_-]+)', c_in_url)
+            target_id = m_id.group(1) if m_id else c_in_url.strip()
+            if target_id:
+                st.session_state.current_folder_id = target_id
+                st.rerun()
+
+    st.markdown("<hr style='border-color:#334155; margin:16px 0;'>", unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -550,7 +610,7 @@ with tab_drive:
 
             # 구글 드라이브에 결과 폴더 자동 생성 및 업로드
             append_log("구글 드라이브로 결과물 자동 업로드 시작...")
-            drive_res_id = create_drive_folder(drive_svc, "소득금액_작업결과", folder_id_input)
+            drive_res_id = create_drive_folder(drive_svc, "소득금액_작업결과", current_folder_id)
             drive_sub_pdf = create_drive_folder(drive_svc, "1. 개별_PDF_추출본", drive_res_id)
             drive_sub_rpt = create_drive_folder(drive_svc, "2. 엑셀_작업리포트", drive_res_id)
             drive_sub_mrg = create_drive_folder(drive_svc, "3. 전체_통합_PDF", drive_res_id)

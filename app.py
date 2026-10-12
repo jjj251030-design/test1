@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-소득금액(회사별) 추출 및 리포트 시스템 - Streamlit Cloud 웹앱 (v5.4)
-모든 기기(PC, Mac, 태블릿, 스마트폰)에서 브라우저 접속으로 구동
-구글 드라이브와 완전 연동되어 서버/클라우드에서 100% 처리
+소득금액(회사별) 추출 및 리포트 시스템 - Streamlit Cloud 웹앱 (v5.5)
+Colab 스타일 실시간 구글 드라이브 탐색기 + 작업별 분리 실행 + 안전 업로드 탑재
+모든 기기(PC, Mac, 태블릿, 스마트폰) 브라우저에서 100% 클라우드 구동
 """
 
 import os, sys, re, io, time, json, shutil, zipfile, traceback
@@ -51,6 +51,14 @@ st.markdown("""
         font-weight: 600;
         color: #93C5FD;
         margin-bottom: 12px;
+    }
+    .path-display {
+        background-color: #020617;
+        padding: 10px 14px;
+        border-radius: 6px;
+        border: 1px solid #334155;
+        margin-bottom: 10px;
+        font-size: 13px;
     }
     .stButton>button {
         background-color: #2563EB;
@@ -127,49 +135,63 @@ def get_drive_service(custom_creds_info=None):
         st.error(f"구글 드라이브 서비스 계정 연결 오류: {e}")
         return None
 
-def get_folder_metadata(service, folder_id):
-    """폴더의 이름 및 상위 폴더(부모) ID 조회"""
-    if not service or not folder_id:
-        return {'id': folder_id, 'name': '알 수 없음', 'parents': []}
+# Colab 스타일 드라이브 폴더 옵션 빌더
+def build_drive_folder_options(service, cur_folder_id):
+    """Colab 스타일 탐색 옵션 생성: [선택 확정], [상위 이동], [하위 진입]"""
+    if not service or not cur_folder_id:
+        return [("📁 [선택 확정] 소득재산 작업", "1X6wWQ_Gik-TgoPXscItFO-B30xmTDIMF")], [], []
+    
+    options = []
     try:
-        f = service.files().get(fileId=folder_id, fields="id, name, parents", supportsAllDrives=True).execute()
-        return f
-    except Exception:
-        return {'id': folder_id, 'name': '소득재산 작업', 'parents': []}
-
-def get_folder_contents(service, folder_id):
-    """지정된 드라이브 폴더 내 하위 폴더 및 파일 목록 실시간 조회"""
-    if not service or not folder_id:
-        return [], [], []
-    try:
-        q = f"'{folder_id}' in parents and trashed = false"
-        results = service.files().list(
+        cur_meta = service.files().get(fileId=cur_folder_id, fields="id, name, parents", supportsAllDrives=True).execute()
+        cur_name = cur_meta.get('name', '작업 폴더')
+        cur_parents = cur_meta.get('parents', [])
+        
+        q = f"'{cur_folder_id}' in parents and trashed = false"
+        res = service.files().list(
             q=q, fields="files(id, name, mimeType, size)", pageSize=200,
             supportsAllDrives=True, includeItemsFromAllDrives=True
         ).execute()
-        items = results.get('files', [])
-        folders = [f for f in items if f['mimeType'] == 'application/vnd.google-apps.folder']
-        folders.sort(key=lambda x: x['name'])
+        items = res.get('files', [])
+        
+        subfolders = [f for f in items if f['mimeType'] == 'application/vnd.google-apps.folder']
+        subfolders.sort(key=lambda x: x['name'])
+        
         pdf_files = [f for f in items if f['name'].lower().endswith('.pdf')]
         pdf_files.sort(key=lambda x: x['name'])
+        
         excel_files = [f for f in items if f['name'].lower().endswith(('.xlsx', '.xls'))]
         excel_files.sort(key=lambda x: x['name'])
-        return folders, pdf_files, excel_files
+        
+        badge = f" (PDF {len(pdf_files)}개 감지)" if pdf_files else ""
+        options.append((f"📁 [선택 확정] {cur_name}{badge}", cur_folder_id))
+        
+        if cur_parents:
+            try:
+                p_meta = service.files().get(fileId=cur_parents[0], fields="id, name", supportsAllDrives=True).execute()
+                p_name = p_meta.get('name', '상위 폴더')
+            except Exception:
+                p_name = "상위 폴더"
+            options.append((f"⬆️ [상위 이동] {p_name}/", f"NAV:{cur_parents[0]}"))
+            
+        for sub in subfolders:
+            options.append((f"📂 [하위 진입] {sub['name']}/", f"NAV:{sub['id']}"))
+            
+        return options, pdf_files, excel_files
     except Exception as e:
-        st.error(f"폴더 내용 조회 실패: {e}")
-        return [], [], []
+        return [(f"📁 [선택 확정] 현재 폴더 ({cur_folder_id})", cur_folder_id)], [], []
 
 def download_file_from_drive(service, file_id, local_dest_path):
     """구글 드라이브 파일을 로컬 임시 경로로 다운로드"""
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     with io.FileIO(local_dest_path, 'wb') as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024*1024*5)
         done = False
         while not done:
             status, done = downloader.next_chunk()
 
-def upload_file_to_drive(service, local_file_path, folder_id, file_name=None):
-    """로컬 파일을 구글 드라이브 특정 폴더에 업로드"""
+def upload_file_to_drive_safe(service, local_file_path, folder_id, file_name=None):
+    """로컬 파일을 구글 드라이브 특정 폴더에 안전하게 업로드 (할당량 초과 시 예외 처리)"""
     if not file_name:
         file_name = os.path.basename(local_file_path)
     file_metadata = {
@@ -177,23 +199,32 @@ def upload_file_to_drive(service, local_file_path, folder_id, file_name=None):
         'parents': [folder_id]
     }
     media = MediaFileUpload(local_file_path, resumable=True)
-    file_obj = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    return file_obj.get('id')
+    try:
+        file_obj = service.files().create(
+            body=file_metadata, media_body=media, fields='id', supportsAllDrives=True
+        ).execute()
+        return file_obj.get('id')
+    except Exception as e:
+        # 서비스 계정 403 Storage Quota 또는 권한 제한 발생 시 안전하게 None 반환
+        return None
 
-def create_drive_folder(service, folder_name, parent_id):
+def create_drive_folder_safe(service, folder_name, parent_id):
     """구글 드라이브 내에 하위 폴더 생성 (이미 있으면 해당 ID 반환)"""
-    q = f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    res = service.files().list(q=q, fields="files(id, name)").execute()
-    existing = res.get('files', [])
-    if existing:
-        return existing[0]['id']
-    meta = {
-        'name': folder_name,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [parent_id]
-    }
-    folder = service.files().create(body=meta, fields='id').execute()
-    return folder.get('id')
+    try:
+        q = f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        res = service.files().list(q=q, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        existing = res.get('files', [])
+        if existing:
+            return existing[0]['id']
+        meta = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [parent_id]
+        }
+        folder = service.files().create(body=meta, fields='id', supportsAllDrives=True).execute()
+        return folder.get('id')
+    except Exception:
+        return parent_id
 
 # 3. 표준 양식 엑셀 메모리 생성 함수
 def create_template_excel(title_name):
@@ -257,7 +288,7 @@ drive_svc = get_drive_service()
 tab_drive, tab_upload = st.tabs(["구글 드라이브 연동 모드 (권장)", "기기에서 직접 업로드 모드"])
 
 with tab_drive:
-    # 키 연동에 실패했을 때 직접 파일 업로드할 수 있는 안전 장치
+    # 0. 서비스 계정 키 파일 직접 등록 상자 (미인증 시)
     if not drive_svc:
         st.markdown('<div class="card-box" style="border-color:#F59E0B;"><div class="card-title" style="color:#FBBF24;">🔑 서비스 계정 키 파일 직접 등록 (1초 연결)</div>', unsafe_allow_html=True)
         st.info("Secrets 자동 연동에 문제가 발생했을 때, 다운로드받으신 서비스 계정 JSON 파일(project-...json)을 첨부하시면 즉시 구글 드라이브가 연결됩니다.")
@@ -272,86 +303,77 @@ with tab_drive:
                 st.error(f"키 파일 읽기 실패: {e_up}")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="card-box"><div class="card-title">1. 📂 구글 드라이브 실시간 폴더 탐색기 및 파일 설정</div>', unsafe_allow_html=True)
+    # 기본 폴더 ID 세션 상태 관리
+    default_base_id = "1X6wWQ_Gik-TgoPXscItFO-B30xmTDIMF"
+    if "target_folder_id" not in st.session_state:
+        st.session_state.target_folder_id = default_base_id
+    if "result_folder_id" not in st.session_state:
+        st.session_state.result_folder_id = default_base_id
+
+    # 1. 📂 대상 작업 폴더 및 대상 파일 설정 (Colab 스타일 드롭다운)
+    st.markdown('<div class="card-box"><div class="card-title">1. 📂 작업 대상 폴더 및 PDF 선택 (Colab 스타일 탐색기)</div>', unsafe_allow_html=True)
     
-    default_work_folder_id = "1X6wWQ_Gik-TgoPXscItFO-B30xmTDIMF"
-    if "current_folder_id" not in st.session_state:
-        st.session_state.current_folder_id = default_work_folder_id
-        
-    current_folder_id = st.session_state.current_folder_id
-    cur_folder_meta = get_folder_metadata(drive_svc, current_folder_id)
-    cur_folder_name = cur_folder_meta.get('name', '소득재산 작업')
-    cur_parent_ids = cur_folder_meta.get('parents', [])
-    
-    subfolders, pdf_files, excel_files = get_folder_contents(drive_svc, current_folder_id)
+    target_options, target_pdfs, target_excels = build_drive_folder_options(drive_svc, st.session_state.target_folder_id)
+    t_labels = [opt[0] for opt in target_options]
+    t_map = {opt[0]: opt[1] for opt in target_options}
 
-    # Colab 스타일 실시간 위치 표시 및 상위/하위 폴더 이동 바
-    st.markdown(f"""
-    <div style="background-color: #020617; padding: 12px 16px; border-radius: 6px; border: 1px solid #334155; margin-bottom: 12px;">
-        <span style="color: #94A3B8; font-size: 13px;">📍 현재 탐색 위치:</span><br>
-        <span style="color: #38BDF8; font-size: 17px; font-weight: 700;">📁 {cur_folder_name}</span>
-        <span style="color: #64748B; font-size: 13px; margin-left: 10px;">(PDF {len(pdf_files)}개 | 엑셀 {len(excel_files)}개 | 하위폴더 {len(subfolders)}개)</span>
-    </div>
-    """, unsafe_allow_html=True)
+    sel_t_label = st.selectbox(
+        "📂 작업 대상 폴더 선택 (클릭 시 상위/하위 폴더로 즉시 이동):",
+        options=t_labels,
+        index=0,
+        key=f"target_nav_{st.session_state.target_folder_id}"
+    )
 
-    nav_c1, nav_c2, nav_c3 = st.columns([1.2, 2.2, 1.2])
-    with nav_c1:
-        has_parent = len(cur_parent_ids) > 0
-        if st.button("⬆️ 상위 폴더로 이동", disabled=not has_parent, use_container_width=True):
-            if has_parent:
-                st.session_state.current_folder_id = cur_parent_ids[0]
-                st.rerun()
+    if t_map[sel_t_label].startswith("NAV:"):
+        st.session_state.target_folder_id = t_map[sel_t_label].replace("NAV:", "")
+        st.rerun()
 
-    with nav_c2:
-        sub_options = ["(📂 하위 폴더 진입 선택...)"] + [f"{f['name']}/" for f in subfolders]
-        selected_sub = st.selectbox("하위 폴더 이동:", options=sub_options, key=f"sub_select_{current_folder_id}", label_visibility="collapsed")
-        if selected_sub != "(📂 하위 폴더 진입 선택...)":
-            t_name = selected_sub.rstrip('/')
-            match_folder = next((f for f in subfolders if f['name'] == t_name), None)
-            if match_folder:
-                st.session_state.current_folder_id = match_folder['id']
-                st.rerun()
+    st.markdown(f'<div class="path-display">📍 현재 대상 폴더: <b>{sel_t_label.split("] ")[-1]}</b> (ID: <code>{st.session_state.target_folder_id}</code>)</div>', unsafe_allow_html=True)
 
-    with nav_c3:
-        if st.button("🏠 기본 작업폴더 복귀", use_container_width=True):
-            st.session_state.current_folder_id = default_work_folder_id
-            st.rerun()
-
-    with st.expander("🔗 다른 폴더 링크(URL) 또는 ID 직접 입력하여 이동"):
-        c_in_url = st.text_input("폴더 링크(URL) 또는 ID:", value=current_folder_id, key="manual_folder_in")
-        if st.button("해당 폴더로 즉시 이동"):
-            m_id = re.search(r'folders/([a-zA-Z0-9_-]+)', c_in_url)
-            target_id = m_id.group(1) if m_id else c_in_url.strip()
-            if target_id:
-                st.session_state.current_folder_id = target_id
-                st.rerun()
-
-    st.markdown("<hr style='border-color:#334155; margin:16px 0;'>", unsafe_allow_html=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        pdf_names = [f['name'] for f in pdf_files]
-        sel_pdf_name = st.selectbox("작업 대상 PDF:", options=pdf_names if pdf_names else ["(감지된 PDF 없음)"])
-        sel_pdf_obj = next((f for f in pdf_files if f['name'] == sel_pdf_name), None)
-
-    with col2:
-        excel_names = ["(선택 안 함)"] + [f['name'] for f in excel_files]
-        sel_extract_db = st.selectbox("추출대상자 DB:", options=excel_names)
-        sel_explain_db = st.selectbox("소명대상자 DB:", options=excel_names)
-
-    # 양식 다운로드 버튼
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        st.download_button("추출대상자DB 양식 다운로드", data=create_template_excel("추출대상자"),
-                           file_name="추출대상자DB_표준양식.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with col_t2:
-        st.download_button("소명대상자DB 양식 다운로드", data=create_template_excel("소명대상자"),
-                           file_name="소명대상자DB_표준양식.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    pdf_options = [f['name'] for f in target_pdfs]
+    sel_pdf_name = st.selectbox("작업 대상 PDF:", options=pdf_options if pdf_options else ["(감지된 PDF 없음)"])
+    sel_pdf_obj = next((f for f in target_pdfs if f['name'] == sel_pdf_name), None)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 2. 추출 모드 및 세부 옵션
-    st.markdown('<div class="card-box"><div class="card-title">2. 추출 모드 및 세부 옵션 설정</div>', unsafe_allow_html=True)
+    # 2. 💾 결과 저장 폴더 설정 (Colab 스타일 드롭다운)
+    st.markdown('<div class="card-box"><div class="card-title">2. 💾 작업 결과물 저장 위치 설정</div>', unsafe_allow_html=True)
+    
+    res_options, _, _ = build_drive_folder_options(drive_svc, st.session_state.result_folder_id)
+    r_labels = [opt[0] for opt in res_options]
+    r_map = {opt[0]: opt[1] for opt in res_options}
+
+    sel_r_label = st.selectbox(
+        "💾 결과물 저장 폴더 선택 (클릭 시 상위/하위 폴더로 즉시 이동):",
+        options=r_labels,
+        index=0,
+        key=f"result_nav_{st.session_state.result_folder_id}"
+    )
+
+    if r_map[sel_r_label].startswith("NAV:"):
+        st.session_state.result_folder_id = r_map[sel_r_label].replace("NAV:", "")
+        st.rerun()
+
+    st.markdown(f'<div class="path-display">💾 현재 저장 위치: <b>{sel_r_label.split("] ")[-1]}</b> / <span style="color:#38BDF8;">소득금액_작업결과</span></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # 3. 📊 대상자 DB 파일 설정 (선택 사항)
+    st.markdown('<div class="card-box"><div class="card-title">3. 📊 추출/소명 대상자 DB 파일 설정 (선택 사항)</div>', unsafe_allow_html=True)
+    
+    excel_options = ["(선택 안 함)"] + [f['name'] for f in target_excels]
+    c_db1, c_db2 = st.columns(2)
+    with c_db1:
+        sel_extract_db = st.selectbox("추출대상자 DB:", options=excel_options)
+        st.download_button("추출대상자DB 표준양식 다운로드", data=create_template_excel("추출대상자"),
+                           file_name="추출대상자DB_표준양식.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with c_db2:
+        sel_explain_db = st.selectbox("소명대상자 DB:", options=excel_options)
+        st.download_button("소명대상자DB 표준양식 다운로드", data=create_template_excel("소명대상자"),
+                           file_name="소명대상자DB_표준양식.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # 4. ⚙️ 추출 모드 및 세부 옵션
+    st.markdown('<div class="card-box"><div class="card-title">4. ⚙️ 추출 모드 및 파일명 서식 설정</div>', unsafe_allow_html=True)
     c_m1, c_m2 = st.columns([1, 2])
     with c_m1:
         extract_mode = st.radio("추출 모드:", ["전체추출", "개별DB 추출"], horizontal=True)
@@ -363,13 +385,65 @@ with tab_drive:
         fn_style = st.selectbox("파일명 서식:", ["성명(관계)  [예: 박현규(본인).pdf]", "성명_관계  [예: 박현규_본인.pdf]", "성명만 표기  [예: 박현규.pdf]"])
     with c_o2:
         dup_style = st.selectbox("동명이인 표기:", ["성명 뒤 번호 붙이기  [예: 박현규1(본인).pdf]", "관계 뒤 번호 붙이기  [예: 박현규(본인1).pdf]", "파일명 끝에 번호 붙이기  [예: 박현규(본인)_1.pdf]"])
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # 5. 🚀 작업 실행 단위 선택 (원클릭 vs 개별 분리 실행)
+    st.markdown('<div class="card-box"><div class="card-title">5. 🚀 작업 실행 선택 (원하는 작업만 골라서 실행)</div>', unsafe_allow_html=True)
+    
+    st.markdown("수행할 작업을 선택하세요:")
+    chk_c1, chk_c2, chk_c3, chk_c4 = st.columns(4)
+    with chk_c1:
+        do_extract = st.checkbox("1. 개별 PDF 추출", value=True)
+    with chk_c2:
+        do_excel = st.checkbox("2. 엑셀 리포트 작성", value=True)
+    with chk_c3:
+        do_merge = st.checkbox("3. 전체 통합 PDF 병합", value=True)
+    with chk_c4:
+        do_zip = st.checkbox("4. 전체 ZIP 일괄 압축", value=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([2, 1.2, 1.2, 1.2])
+    with btn_col1:
+        btn_start_all = st.button("🚀 선택한 작업 일괄 실행 (원클릭)", use_container_width=True)
+    with btn_col2:
+        btn_extract_only = st.button("📄 추출+엑셀만", use_container_width=True)
+    with btn_col3:
+        btn_merge_only = st.button("📑 통합PDF만", use_container_width=True)
+    with btn_col4:
+        btn_zip_only = st.button("📦 ZIP압축만", use_container_width=True)
+
+    # 실행 조건 바인딩
+    run_extract = False
+    run_excel = False
+    run_merge = False
+    run_zip = False
+
+    if btn_start_all:
+        run_extract = do_extract
+        run_excel = do_excel
+        run_merge = do_merge
+        run_zip = do_zip
+    elif btn_extract_only:
+        run_extract = True
+        run_excel = True
+        run_merge = False
+        run_zip = False
+    elif btn_merge_only:
+        run_extract = True  # 병합을 위해 추출 필요
+        run_excel = False
+        run_merge = True
+        run_zip = False
+    elif btn_zip_only:
+        run_extract = True
+        run_excel = True
+        run_merge = True
+        run_zip = True
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 3. 실행 버튼 및 실시간 진행
-    btn_start = st.button("추출 및 엑셀 리포트 실행 (구글 드라이브 직접 저장)", use_container_width=True)
-
-    if btn_start:
+    # 실제 실행 루틴
+    if run_extract or run_excel or run_merge or run_zip:
         if not sel_pdf_obj:
             st.error("유효한 작업 대상 PDF 파일을 선택해 주세요.")
         else:
@@ -383,7 +457,7 @@ with tab_drive:
                 joined_logs = chr(10).join(log_messages)
                 log_area.markdown(f'<div class="log-box">{joined_logs}</div>', unsafe_allow_html=True)
 
-            append_log("시스템 준비 완료. 클라우드 작업 세션을 시작합니다.")
+            append_log("클라우드 작업 세션을 시작합니다.")
             
             # 작업용 로컬 임시 디렉토리
             work_dir = f"/tmp/income_work_{int(time.time())}"
@@ -394,7 +468,7 @@ with tab_drive:
             for p in [sub_pdf_dir, sub_rpt_dir, sub_mrg_dir, sub_log_dir]:
                 os.makedirs(p, exist_ok=True)
 
-            # 구글 드라이브에서 PDF 다운로드
+            # 구글 드라이브에서 원본 PDF 다운로드
             local_pdf_path = os.path.join(work_dir, sel_pdf_obj['name'])
             append_log(f"구글 드라이브에서 원본 PDF 수신 중: {sel_pdf_obj['name']}...")
             download_file_from_drive(drive_svc, sel_pdf_obj['id'], local_pdf_path)
@@ -403,7 +477,7 @@ with tab_drive:
             # DB 파일 다운로드 및 파싱
             extract_targets = set()
             if extract_mode == "개별DB 추출" and sel_extract_db != "(선택 안 함)":
-                db_obj = next((f for f in excel_files if f['name'] == sel_extract_db), None)
+                db_obj = next((f for f in target_excels if f['name'] == sel_extract_db), None)
                 if db_obj:
                     local_db_path = os.path.join(work_dir, db_obj['name'])
                     download_file_from_drive(drive_svc, db_obj['id'], local_db_path)
@@ -416,7 +490,7 @@ with tab_drive:
 
             explain_targets = set()
             if sel_explain_db != "(선택 안 함)":
-                db_obj = next((f for f in excel_files if f['name'] == sel_explain_db), None)
+                db_obj = next((f for f in target_excels if f['name'] == sel_explain_db), None)
                 if db_obj:
                     local_db_path = os.path.join(work_dir, db_obj['name'])
                     download_file_from_drive(drive_svc, db_obj['id'], local_db_path)
@@ -474,12 +548,13 @@ with tab_drive:
                     if p['rel'] == '본인':
                         name_counts[p['name']] += 1
 
-            # 상세 추출
-            append_log("pdfplumber 표 정밀 파싱 및 개별 PDF 생성 시작...")
-            plumber_pdf = pdfplumber.open(local_pdf_path)
+            # 상세 추출 및 개별 PDF 생성
             extracted_records = []
+            plumber_pdf = pdfplumber.open(local_pdf_path)
             reader = PdfReader(local_pdf_path)
             name_seq_counter = Counter()
+
+            append_log("표 정밀 분석 및 개별 작업 처리 중...")
 
             for idx, (p_idx, persons) in enumerate(parsed_pages):
                 if extract_mode == "개별DB 추출":
@@ -504,12 +579,20 @@ with tab_drive:
                     dup_str = f"O ({seq}차)"
                     num_tag = str(seq)
 
-                out_fn = f"{m_name}{num_tag}({m_rel}).pdf"
+                # 파일명 생성 규칙 적용
+                if fn_style.startswith("성명_관계"):
+                    out_fn = f"{m_name}{num_tag}_{m_rel}.pdf"
+                elif fn_style.startswith("성명만"):
+                    out_fn = f"{m_name}{num_tag}.pdf"
+                else:
+                    out_fn = f"{m_name}{num_tag}({m_rel}).pdf"
+
                 out_pdf_path = os.path.join(sub_pdf_dir, out_fn)
-                writer = PdfWriter()
-                writer.add_page(reader.pages[p_idx])
-                with open(out_pdf_path, "wb") as f_out:
-                    writer.write(f_out)
+                if run_extract:
+                    writer = PdfWriter()
+                    writer.add_page(reader.pages[p_idx])
+                    with open(out_pdf_path, "wb") as f_out:
+                        writer.write(f_out)
 
                 page_obj = plumber_pdf.pages[p_idx]
                 tables = page_obj.extract_tables()
@@ -553,90 +636,111 @@ with tab_drive:
                 }
                 extracted_records.append(rec)
                 if len(extracted_records) % 20 == 0 or idx == len(parsed_pages) - 1:
-                    append_log(f"[{len(extracted_records)}] {out_fn} 추출 완료")
-                prog_bar.progress(30 + int((idx + 1) / len(parsed_pages) * 45))
+                    append_log(f"[{len(extracted_records)}] {out_fn} 분석 완료")
+                prog_bar.progress(30 + int((idx + 1) / len(parsed_pages) * 40))
 
             plumber_pdf.close()
 
-            # 엑셀 마스터 리포트 생성 (단일 .xlsx)
-            append_log("엑셀 마스터 리포트 서식 적용 및 작성 중...")
-            excel_path = os.path.join(sub_rpt_dir, "소득금액_추출작업_리포트.xlsx")
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "소득금액_추출현황"
-            headers = ["구분", "소명대상자", "동명이인", "성명", "관계",
-                       "세대구성원1 성명", "세대구성원1 관계", "세대구성원2 성명", "세대구성원2 관계",
-                       "추출파일명", "원본페이지", "자료명", "환산소득금액", "회사명", "보수년월", "연계기관(자료명)", "소득상세_요약"]
-            ws.append(headers)
+            # 엑셀 마스터 리포트 작성
+            excel_path = None
+            if run_excel:
+                append_log("엑셀 마스터 리포트 작성 중...")
+                excel_path = os.path.join(sub_rpt_dir, "소득금액_추출작업_리포트.xlsx")
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "소득금액_추출현황"
+                headers = ["구분", "소명대상자", "동명이인", "성명", "관계",
+                           "세대구성원1 성명", "세대구성원1 관계", "세대구성원2 성명", "세대구성원2 관계",
+                           "추출파일명", "원본페이지", "자료명", "환산소득금액", "회사명", "보수년월", "연계기관(자료명)", "소득상세_요약"]
+                ws.append(headers)
 
-            for rec in extracted_records:
-                p_others = [p for p in rec['persons'] if not (p['name'] == rec['name'] and p['rel'] == rec['rel'])]
-                m1_name = p_others[0]['name'] if len(p_others) > 0 else ""
-                m1_rel = p_others[0]['rel'] if len(p_others) > 0 else ""
-                m2_name = p_others[1]['name'] if len(p_others) > 1 else ""
-                m2_rel = p_others[1]['rel'] if len(p_others) > 1 else ""
-                ws.append([rec['idx'], rec['is_explain'], rec['is_dup'], rec['name'], rec['rel'],
-                           m1_name, m1_rel, m2_name, m2_rel, rec['filename'], rec['orig_page'],
-                           rec['doc_type'], rec['amount'], rec['company'], rec['pay_date'], rec['agency'], rec['summary']])
+                for rec in extracted_records:
+                    p_others = [p for p in rec['persons'] if not (p['name'] == rec['name'] and p['rel'] == rec['rel'])]
+                    m1_name = p_others[0]['name'] if len(p_others) > 0 else ""
+                    m1_rel = p_others[0]['rel'] if len(p_others) > 0 else ""
+                    m2_name = p_others[1]['name'] if len(p_others) > 1 else ""
+                    m2_rel = p_others[1]['rel'] if len(p_others) > 1 else ""
+                    ws.append([rec['idx'], rec['is_explain'], rec['is_dup'], rec['name'], rec['rel'],
+                               m1_name, m1_rel, m2_name, m2_rel, rec['filename'], rec['orig_page'],
+                               rec['doc_type'], rec['amount'], rec['company'], rec['pay_date'], rec['agency'], rec['summary']])
 
-            header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = Font(name="맑은 고딕", size=10, bold=True, color="FFFFFF")
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+                for cell in ws[1]:
+                    cell.fill = header_fill
+                    cell.font = Font(name="맑은 고딕", size=10, bold=True, color="FFFFFF")
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-            wb.save(excel_path)
+                wb.save(excel_path)
+                append_log("엑셀 마스터 리포트 작성 완료.")
 
-            # 전체 통합 PDF 생성
-            append_log("전체 1권 통합 PDF 생성 중...")
-            mrg_path = os.path.join(sub_mrg_dir, "소득금액_특정페이지_전체통합.pdf")
-            pdf_files_extracted = sorted([os.path.join(sub_pdf_dir, f) for f in os.listdir(sub_pdf_dir) if f.lower().endswith(".pdf")])
-            m_writer = PdfWriter()
-            for pf in pdf_files_extracted:
-                r_tmp = PdfReader(pf)
-                for p in r_tmp.pages: m_writer.add_page(p)
-            with open(mrg_path, "wb") as f_m: m_writer.write(f_m)
+            # 전체 1권 통합본 PDF 병합
+            mrg_path = None
+            if run_merge:
+                append_log("전체 1권 통합본 PDF 생성 중...")
+                mrg_path = os.path.join(sub_mrg_dir, "소득금액_특정페이지_전체통합.pdf")
+                pdf_files_extracted = sorted([os.path.join(sub_pdf_dir, f) for f in os.listdir(sub_pdf_dir) if f.lower().endswith(".pdf")])
+                m_writer = PdfWriter()
+                for pf in pdf_files_extracted:
+                    r_tmp = PdfReader(pf)
+                    for p in r_tmp.pages: m_writer.add_page(p)
+                with open(mrg_path, "wb") as f_m: m_writer.write(f_m)
+                append_log("전체 1권 통합본 PDF 생성 완료.")
 
-            # 전체 ZIP 압축
-            append_log("결과물 전체 ZIP 압축 중...")
-            zip_path = os.path.join(work_dir, "소득금액_추출작업_전체결과.zip")
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for root, dirs, files in os.walk(work_dir):
-                    for file in files:
-                        if file.endswith('.zip') or file.endswith('.pdf') and root == work_dir: continue
-                        full_p = os.path.join(root, file)
-                        rel_p = os.path.relpath(full_p, work_dir)
-                        zf.write(full_p, rel_p)
+            # 전체 ZIP 일괄 압축
+            zip_path = None
+            if run_zip:
+                append_log("결과물 전체 ZIP 압축 중...")
+                zip_path = os.path.join(work_dir, "소득금액_추출작업_전체결과.zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for root, dirs, files in os.walk(work_dir):
+                        for file in files:
+                            if file.endswith('.zip') or (file.endswith('.pdf') and root == work_dir): continue
+                            full_p = os.path.join(root, file)
+                            rel_p = os.path.relpath(full_p, work_dir)
+                            zf.write(full_p, rel_p)
+                append_log("결과물 전체 ZIP 압축 완료.")
 
-            # 구글 드라이브에 결과 폴더 자동 생성 및 업로드
-            append_log("구글 드라이브로 결과물 자동 업로드 시작...")
-            drive_res_id = create_drive_folder(drive_svc, "소득금액_작업결과", current_folder_id)
-            drive_sub_pdf = create_drive_folder(drive_svc, "1. 개별_PDF_추출본", drive_res_id)
-            drive_sub_rpt = create_drive_folder(drive_svc, "2. 엑셀_작업리포트", drive_res_id)
-            drive_sub_mrg = create_drive_folder(drive_svc, "3. 전체_통합_PDF", drive_res_id)
-            drive_sub_log = create_drive_folder(drive_svc, "4. 시스템_작업로그", drive_res_id)
+            # 구글 드라이브 업로드 시도 (저장 대상 폴더 지정)
+            target_res_folder_id = st.session_state.result_folder_id
+            append_log(f"구글 드라이브 지정 폴더로 업로드 시도 중...")
+            drive_res_id = create_drive_folder_safe(drive_svc, "소득금액_작업결과", target_res_folder_id)
+            drive_sub_rpt = create_drive_folder_safe(drive_svc, "2. 엑셀_작업리포트", drive_res_id)
+            drive_sub_mrg = create_drive_folder_safe(drive_svc, "3. 전체_통합_PDF", drive_res_id)
 
-            upload_file_to_drive(drive_svc, excel_path, drive_sub_rpt)
-            upload_file_to_drive(drive_svc, mrg_path, drive_sub_mrg)
-            upload_file_to_drive(drive_svc, zip_path, drive_res_id)
+            upload_success = True
+            if excel_path and os.path.exists(excel_path):
+                up_id = upload_file_to_drive_safe(drive_svc, excel_path, drive_sub_rpt)
+                if not up_id: upload_success = False
 
-            # 로그 파일 저장
-            log_path = os.path.join(sub_log_dir, f"작업실행_상세로그_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-            with open(log_path, "w", encoding="utf-8") as f_l:
-                f_l.write("\n".join(log_messages))
-            upload_file_to_drive(drive_svc, log_path, drive_sub_log)
+            if mrg_path and os.path.exists(mrg_path):
+                up_id = upload_file_to_drive_safe(drive_svc, mrg_path, drive_sub_mrg)
+                if not up_id: upload_success = False
+
+            if zip_path and os.path.exists(zip_path):
+                up_id = upload_file_to_drive_safe(drive_svc, zip_path, drive_res_id)
+                if not up_id: upload_success = False
 
             prog_bar.progress(100)
-            append_log("구글 드라이브 저장 완료! 모든 작업이 성공적으로 종료되었습니다.")
-            st.success(f"총 {len(extracted_records)}건 추출 완료! 구글 드라이브 '소득금액_작업결과' 폴더에 자동 저장되었습니다.")
+
+            if upload_success:
+                append_log("구글 드라이브 저장 완료! 지정 폴더의 '소득금액_작업결과'에 파일이 보관되었습니다.")
+                st.success(f"총 {len(extracted_records)}건 작업 성공! 구글 드라이브 저장 폴더에 저장되었습니다.")
+            else:
+                append_log("알림: 서비스 계정 개인드라이브 용량 정책(Storage Quota 0GB)으로 인해 드라이브 직접 저장은 스킵되었습니다.")
+                st.info("💡 모든 파일이 정상 생성되었습니다! 브라우저 다운로드 버튼을 눌러 즉시 저장하세요.")
 
             # 브라우저 직접 다운로드 버튼 제공
-            with open(zip_path, "rb") as fz:
-                st.download_button("결과물 전체 ZIP 즉시 다운로드", data=fz.read(), file_name="소득금액_추출작업_전체결과.zip", mime="application/zip")
-            with open(excel_path, "rb") as fe:
-                st.download_button("엑셀 리포트 즉시 다운로드", data=fe.read(), file_name="소득금액_추출작업_리포트.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            btn_down_cols = st.columns(3)
+            if zip_path and os.path.exists(zip_path):
+                with open(zip_path, "rb") as fz:
+                    btn_down_cols[0].download_button("📦 전체 ZIP 다운로드", data=fz.read(), file_name="소득금액_추출작업_전체결과.zip", mime="application/zip", use_container_width=True)
+            if excel_path and os.path.exists(excel_path):
+                with open(excel_path, "rb") as fe:
+                    btn_down_cols[1].download_button("📊 엑셀 리포트 다운로드", data=fe.read(), file_name="소득금액_추출작업_리포트.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            if mrg_path and os.path.exists(mrg_path):
+                with open(mrg_path, "rb") as fm:
+                    btn_down_cols[2].download_button("📑 전체 통합 PDF 다운로드", data=fm.read(), file_name="소득금액_특정페이지_전체통합.pdf", mime="application/pdf", use_container_width=True)
 
-            # 임시 파일 정리
             shutil.rmtree(work_dir, ignore_errors=True)
 
 with tab_upload:

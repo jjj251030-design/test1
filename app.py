@@ -80,27 +80,42 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 2. 구글 드라이브 API 클라이언트 초기화
-def get_drive_service():
-    """Streamlit Secrets에 등록된 서비스 계정 키를 통해 Google Drive API 클라이언트 생성"""
-    if "gcp_service_account" not in st.secrets:
+def get_drive_service(custom_creds_info=None):
+    """Streamlit Secrets 또는 업로드된 JSON 키 파일을 통해 Google Drive API 클라이언트 생성"""
+    creds_info = None
+    if custom_creds_info is not None:
+        creds_info = dict(custom_creds_info)
+    elif "uploaded_creds_info" in st.session_state and st.session_state.uploaded_creds_info:
+        creds_info = dict(st.session_state.uploaded_creds_info)
+    elif "gcp_service_account" in st.secrets:
+        try:
+            raw_sa = st.secrets["gcp_service_account"]
+            if isinstance(raw_sa, str):
+                creds_info = json.loads(raw_sa)
+            else:
+                creds_info = dict(raw_sa)
+        except Exception as e:
+            st.error(f"Secrets 파싱 오류: {e}")
+            return None
+
+    if not creds_info:
         return None
+
     try:
-        raw_sa = st.secrets["gcp_service_account"]
-        if isinstance(raw_sa, str):
-            creds_info = json.loads(raw_sa)
-        else:
-            creds_info = dict(raw_sa)
-            
-        # PEM private_key 서식 자동 복원 및 정규화
+        # PEM private_key 서식 완전 정규화 (문자열 이스케이프 및 base64 패딩 복원)
         if "private_key" in creds_info:
             pk = str(creds_info["private_key"])
-            m = re.search(r"(-+BEGIN [^-]+-+)([\s\S]*?)(-+END [^-]+-+)", pk)
+            s = pk.replace(r"\r\n", chr(10)).replace(r"\n", chr(10)).replace(r"\r", chr(10))
+            s = s.replace(r"\\n", chr(10)).replace(r"\\r", chr(10))
+            m = re.search(r"(-+BEGIN [^-]+-+)([\s\S]*?)(-+END [^-]+-+)", s)
             if m:
                 header = m.group(1).strip()
-                body = m.group(2)
+                raw_body = m.group(2)
                 footer = m.group(3).strip()
-                clean_body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
-                b_lines = [clean_body[j:j+64] for j in range(0, len(clean_body), 64)]
+                clean_b64 = re.sub(r"[^A-Za-z0-9+/=]", "", raw_body)
+                if len(clean_b64) % 4 != 0:
+                    clean_b64 += "=" * ((4 - len(clean_b64) % 4) % 4)
+                b_lines = [clean_b64[j:j+64] for j in range(0, len(clean_b64), 64)]
                 creds_info["private_key"] = header + chr(10) + chr(10).join(b_lines) + chr(10) + footer + chr(10)
 
         creds = service_account.Credentials.from_service_account_info(
@@ -227,6 +242,21 @@ drive_svc = get_drive_service()
 tab_drive, tab_upload = st.tabs(["구글 드라이브 연동 모드 (권장)", "기기에서 직접 업로드 모드"])
 
 with tab_drive:
+    # 키 연동에 실패했을 때 직접 파일 업로드할 수 있는 안전 장치
+    if not drive_svc:
+        st.markdown('<div class="card-box" style="border-color:#F59E0B;"><div class="card-title" style="color:#FBBF24;">🔑 서비스 계정 키 파일 직접 등록 (1초 연결)</div>', unsafe_allow_html=True)
+        st.info("Secrets 자동 연동에 문제가 발생했을 때, 다운로드받으신 서비스 계정 JSON 파일(project-...json)을 첨부하시면 즉시 구글 드라이브가 연결됩니다.")
+        uploaded_key = st.file_uploader("서비스 계정 JSON 파일 업로드:", type=["json"], key="key_uploader")
+        if uploaded_key:
+            try:
+                loaded_info = json.load(uploaded_key)
+                st.session_state.uploaded_creds_info = loaded_info
+                st.success("서비스 계정 키 파일 인식 완료! 시스템을 새로고침합니다.")
+                st.rerun()
+            except Exception as e_up:
+                st.error(f"키 파일 읽기 실패: {e_up}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
     st.markdown('<div class="card-box"><div class="card-title">1. 구글 드라이브 작업 폴더 및 대상 파일 설정</div>', unsafe_allow_html=True)
     
     # 기본 폴더 ID (사용자의 소득재산 작업 폴더 ID)
@@ -550,7 +580,7 @@ with tab_drive:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 with tab_upload:
-    st.info("이탭은 구글 드라이브를 거치지 않고, 스마트폰이나 PC의 로컬 파일을 직접 웹 화면에 드래그하여 바로 추출할 때 사용합니다.")
+    st.info("이 탭은 구글 드라이브를 거치지 않고, 스마트폰이나 PC의 로컬 파일을 직접 웹 화면에 드래그하여 바로 추출할 때 사용합니다.")
     up_pdf = st.file_uploader("작업 대상 PDF 업로드:", type=["pdf"])
     up_db = st.file_uploader("소명/추출 대상자 DB 업로드 (선택):", type=["xlsx", "xls"])
     if up_pdf and st.button("직접 업로드 파일로 추출 실행"):

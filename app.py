@@ -270,11 +270,11 @@ with tab_drive:
             log_area = st.empty()
             log_messages = []
 
-def append_log(msg):
-             ts = datetime.now().strftime("[%H:%M:%S] ")
-             log_messages.append(ts + msg)
-             joined_logs = chr(10).join(log_messages)
-             log_area.markdown(f'<div class="log-box">{joined_logs}</div>', unsafe_allow_html=True)
+            def append_log(msg):
+                ts = datetime.now().strftime("[%H:%M:%S] ")
+                log_messages.append(ts + msg)
+                joined_logs = chr(10).join(log_messages)
+                log_area.markdown(f'<div class="log-box">{joined_logs}</div>', unsafe_allow_html=True)
 
             append_log("시스템 준비 완료. 클라우드 작업 세션을 시작합니다.")
             
